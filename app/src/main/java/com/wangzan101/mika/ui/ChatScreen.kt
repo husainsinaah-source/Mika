@@ -5,11 +5,15 @@ import com.wangzan101.mika.core.agent.QuoteMessage
 import com.wangzan101.mika.core.record.ConversationTokens
 import com.wangzan101.mika.core.cap.web.AttachedPage
 import com.wangzan101.mika.ui.components.keepsKeyboard
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.StringRes
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
@@ -62,6 +66,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -141,6 +146,9 @@ import com.wangzan101.mika.ui.theme.MikaTheme
 import com.wangzan101.mika.ui.viewer.FileViewer
 import com.wangzan101.mika.ui.theme.MikaType
 import com.wangzan101.mika.voice.HoldToTalk
+import com.wangzan101.mika.voice.MikaSpokenReplies
+import com.wangzan101.mika.voice.MikaWakeListener
+import androidx.lifecycle.compose.LifecycleStartEffect
 import com.wangzan101.mika.voice.VoiceSource
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
@@ -264,6 +272,47 @@ fun ChatScreen(
     val c = MikaTheme.colors
     val backdrop = rememberGlassBackdrop()
     val context = LocalContext.current
+
+    // Spoken replies and "Hey Mika" are independent controls. Wake listening is
+    // OFF until the user explicitly taps the header microphone and grants access.
+    var wakeEnabled by rememberSaveable { mutableStateOf(false) }
+    var spokenEnabled by rememberSaveable { mutableStateOf(true) }
+    val spokenReplies = remember(context) { MikaSpokenReplies(context) }
+    val wakeListener = remember(context) { MikaWakeListener(context) }
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        wakeEnabled = granted
+        if (!granted) Toast.makeText(context, "Microphone permission is required for Hey Mika", Toast.LENGTH_LONG).show()
+    }
+    wakeListener.onCommand = { words ->
+        if (words.isNullOrBlank()) {
+            if (spokenEnabled) spokenReplies.say("Yes, I'm listening.")
+        } else if (vm.send(words, check)) {
+            input = ""
+        }
+    }
+    DisposableEffect(wakeListener, spokenReplies) {
+        onDispose {
+            wakeListener.release()
+            spokenReplies.release()
+        }
+    }
+    // Recognize only while this screen is STARTED, and never hear Mika's own TTS
+    // or compete with the existing hold-to-talk recorder for the microphone.
+    LifecycleStartEffect(wakeEnabled, voiceHolding, spokenReplies.speaking) {
+        if (wakeEnabled && !voiceHolding && !spokenReplies.speaking) wakeListener.start()
+        else wakeListener.stop()
+        onStopOrDispose { wakeListener.stop() }
+    }
+    val replyKey = "${ui.conversationId}:${ui.exchanges.size}:${(last?.status as? ExchangeStatus.Done)?.answer?.hashCode()}"
+    var handledReplyKey by remember { mutableStateOf(replyKey) }
+    LaunchedEffect(replyKey, spokenEnabled) {
+        if (handledReplyKey != replyKey) {
+            handledReplyKey = replyKey
+            val finished = last?.status as? ExchangeStatus.Done
+            if (spokenEnabled && last?.live == true && finished != null) spokenReplies.say(finished.answer)
+        }
+    }
+
     /** 长按了的那条消息;菜单开着(收起的动画放完才清掉)。 */
     var menu by remember { mutableStateOf<MessageTarget?>(null) }
     /** 选了「选择文字」的那条:它换回系统的长按选中;换对话时清掉。 */
@@ -332,7 +381,27 @@ fun ChatScreen(
                 left = MikaIcons.Menu, leftLabel = stringResource(R.string.chat_menu), onLeft = onOpenDrawer,
                 // 别的对话里还有任务在跑(并行时):菜单上一个小圆点,侧栏「进行中」里能切过去
                 leftBadge = others.isNotEmpty(),
-                right = { BarIconButton(MikaIcons.New, stringResource(R.string.chat_new), { vm.newConversation() }, enabled = vm.canSwitch()) },
+                right = {
+                    BarIconButton(
+                        MikaIcons.Mic, if (wakeEnabled) "Turn off Hey Mika" else "Turn on Hey Mika",
+                        {
+                            if (wakeEnabled) wakeEnabled = false
+                            else if (!wakeListener.available) Toast.makeText(context, "No Android speech recognition service installed", Toast.LENGTH_LONG).show()
+                            else if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) wakeEnabled = true
+                            else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                        },
+                        badge = wakeEnabled,
+                    )
+                    BarIconButton(
+                        if (spokenEnabled) MikaIcons.Speaker else MikaIcons.Mute,
+                        if (spokenEnabled) "Mute Mika's spoken replies" else "Enable Mika's spoken replies",
+                        {
+                            spokenEnabled = !spokenEnabled
+                            if (!spokenEnabled) spokenReplies.stop()
+                        },
+                    )
+                    BarIconButton(MikaIcons.New, stringResource(R.string.chat_new), { vm.newConversation() }, enabled = vm.canSwitch())
+                },
                 subtitle = sub?.first,
                 subtitleColor = when (sub?.second) {
                     ChatCopy.Tone.Accent -> c.accent
